@@ -29,6 +29,11 @@ def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor):
     delta = q - w
     return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
 
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision('highest')
 
 class GPTQ:
 
@@ -74,13 +79,13 @@ class GPTQ:
             input: batch of layer inputs
         """
         # get batch size
-        batch_size = input.shape[0]
+        batch_size: int = input.size(0)
         # init hessian
         if self.H is None:
-            self.H = torch.zeros((self.d_col, self.d_col), device=input.device, dtype=torch.float32)
-        # input reshaping
+            self.H = torch.zeros(input.size(-1), input.size(-1), dtype=torch.float32, device=input.device)        # input reshaping
+        
         if isinstance(self.layer, nn.Linear):
-            input = input.reshape(-1, input.shape[-1])
+            input = input.flatten(end_dim=-2)
         else:
             unfold = nn.Unfold(
                 self.layer.kernel_size,
@@ -91,14 +96,9 @@ class GPTQ:
             # output size (batch_size, channels * \prod kernel_size, num_patches)
             input = unfold(input)
             input = input.transpose(1, 2).flatten(0, 1)
-        # cast input to float32 before addition
-        input = input.float()
-        # rescale and update matrix
-        beta = self.num_samples / (self.num_samples + batch_size)
-        alpha = 2.0 / (self.num_samples + batch_size)
-        self.H.mul_(beta)
-        input.mul_(math.sqrt(alpha))
-        accumulate_hessian(self.H, input)
+        # self.H *= self.num_samples / (self.num_samples + batch_size)
+        # accumulate_hessian(self.H, input.to(dtype=torch.float32) * (self.num_samples + batch_size) ** -.5)  # X^T X
+        accumulate_hessian(self.H, input.to(dtype=torch.float32))  # X^T X
         self.num_samples += batch_size
 
     def reset(self) -> None:
@@ -115,6 +115,7 @@ class GPTQ:
         # 1) Hessian preparation
         assert self.H is not None, "One has to process at least one sample of calibration data to run pruning"
         # 2) Weight preparation
+        self.H = 2.*self.H/self.num_samples
         # copy weight, flatten and convert to float
         self.W = self.W.clone().float()
         if isinstance(self.layer, _ConvNd):
@@ -359,6 +360,7 @@ def gptq_quantization(
                 # Attach hook
                 def update_handle_hook(name):
                     def _hook(_, inp, out):
+                        #TODO: check if inp[0] changed 
                         gptq_handles[name].update(inp[0])
                     return _hook
                 hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
@@ -383,9 +385,8 @@ def gptq_quantization(
             gptq_handles["mlp.up_proj"].quantizer.global_scale = gate_up_global_scale
 
         # 5. Process calibration data
-        device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
         for inp_args, inp_kwargs in zip(input_args, input_kwargs):
-            with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
+            with torch.no_grad():
                 block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
         # Remove hooks
         for hook in hooks.values():
@@ -446,7 +447,7 @@ def gptq_quantization(
         # 8. Update activations
         device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
         for inp_args, inp_kwargs in zip(input_args, input_kwargs):
-            with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
+            with torch.no_grad():
                 out = block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
             out = maybe_first_element(out).to(act_offload_device)
             # change only first input argument
